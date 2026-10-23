@@ -1,0 +1,97 @@
+name: Windows build
+
+# Builds only Highlight Autoclip's Windows installer, from the private source repo, on GitHub's
+# free Windows runner (the app can't be built for Windows on a Mac). It holds no signing key: the
+# owner's Mac signs the update manifest and adds the .exe to the release (scripts/release.mjs in
+# the source repo). The source is read through a read-only deploy key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source commit to build"
+        required: true
+      version:
+        description: "Version, e.g. 1.0.2"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+        working-directory: highlight-autoclip-tool
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: RedR25/standup-comedy-tools
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: highlight-autoclip-tool/package-lock.json
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+
+      # PyInstaller from its sdist, its bootloader compiled here: the stock one is byte-identical in
+      # countless programs, malware among them, so antivirus scores it badly.
+      - name: Compile PyInstaller's bootloader here
+        run: |
+          echo "UV_NO_BINARY_PACKAGE=pyinstaller" >> "$GITHUB_ENV"
+          echo "PYINSTALLER_COMPILE_BOOTLOADER=1" >> "$GITHUB_ENV"
+
+      - name: Install
+        run: |
+          npm ci
+          npm run py:setup
+
+      - name: Check the bootloader was compiled here
+        run: |
+          python/.venv/Scripts/python - <<'PY'
+          import hashlib, io, json, sys, urllib.request, zipfile
+          from pathlib import Path
+          import PyInstaller
+          name = "PyInstaller/bootloader/Windows-64bit-intel/run.exe"
+          ours = hashlib.sha256(Path(PyInstaller.HOMEPATH, name).read_bytes()).hexdigest()
+          meta = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/pyinstaller/{PyInstaller.__version__}/json"))
+          url, = [f["url"] for f in meta["urls"] if f["filename"].endswith("win_amd64.whl")]
+          with zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read())) as z:
+              stock = hashlib.sha256(z.read(name)).hexdigest()
+          if ours == stock:
+              sys.exit("::error::run.exe is PyInstaller's stock bootloader, not one compiled here.")
+          print("bootloader compiled here")
+          PY
+
+      # Verbose and bounded: a stuck test shows by name instead of running to the job limit.
+      - name: Test
+        timeout-minutes: 45
+        env:
+          PYTHONFAULTHANDLER: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          node --test tests/*.test.ts
+          uv run --project python python -m unittest discover -v -s python -p "test_*.py"
+
+      - name: Package
+        run: npm run build:win -- -c.extraMetadata.version="$VERSION"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows
+          retention-days: 3
+          path: highlight-autoclip-tool/dist/*-setup.exe
+          if-no-files-found: error
