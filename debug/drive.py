@@ -35,10 +35,11 @@ def log(*a):
 
 
 class Backend:
-    def __init__(self, exe, data):
+    def __init__(self, exe, data, **extra):
         global DATA
         DATA = data
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
+        env.update(extra)
         env.update(AUTOCLIP_DATA_DIR=str(data), AUTOCLIP_VIDEOS_DIR=str(VIDEOS), AUTOCLIP_NODE=str(APP),
                    ELECTRON_RUN_AS_NODE="1")
         self.p = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -337,9 +338,52 @@ def fixed():
         b.stop()
 
 
+def ps(cmd):
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=120)
+    return (r.stdout + r.stderr).strip()
+
+
+def profile():
+    """A Windows user whose name isn't ASCII: TEMP and AppData (the data dir) under it."""
+    home = TEMP / "Users" / "Trần Văn Đức"
+    tmp = home / "AppData" / "Local" / "Temp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    b = Backend(INSTALL / "resources" / "backend" / "backend.exe",
+                home / "AppData" / "Roaming" / "highlight-autoclip-tool", TEMP=str(tmp), TMP=str(tmp))
+    try:
+        p, s = setup(b)
+        seg = segment(p["id"], s["id"], "Hồ sơ người dùng có dấu")
+        export(b, seg, "non-ASCII TEMP + data dir: first export")
+        export(b, seg, "non-ASCII TEMP + data dir: re-export")
+    finally:
+        b.stop()
+
+
+def cfa():
+    """Defender's Controlled folder access (ransomware protection) guards Videos against unknown apps."""
+    b = Backend(INSTALL / "resources" / "backend" / "backend.exe", TEMP / "data-cfa")
+    try:
+        p, s = setup(b)  # sources made before the guard goes up
+        seg = segment(p["id"], s["id"], "Bảo vệ thư mục")
+        log("CFA on:", ps("Set-MpPreference -EnableControlledFolderAccess Enabled; Start-Sleep 5;"
+                          " (Get-MpPreference).EnableControlledFolderAccess"))
+        export(b, seg, "Controlled folder access on: first export")
+        log("CFA blocks:", ps("Get-WinEvent -LogName 'Microsoft-Windows-Windows Defender/Operational' -MaxEvents 50 |"
+                              " Where-Object Id -eq 1123 | Select-Object -First 5 | ForEach-Object { $_.Message -replace '\\s+', ' ' }")[:1500])
+    finally:
+        log("CFA off:", ps("Set-MpPreference -EnableControlledFolderAccess Disabled; (Get-MpPreference).EnableControlledFolderAccess"))
+        b.stop()
+
+
 def main():
     log("python", sys.version)
     log("videos:", VIDEOS)
+    if "profile" in ONLY:
+        profile()
+    if "cfa" in ONLY:
+        cfa()
+    if ONLY and ONLY <= {"profile", "cfa"}:
+        return log("\n===== SUMMARY =====\n" + "\n".join(json.dumps(r, ensure_ascii=False) for r in RESULTS))
     shipped()
     if not ONLY or "fix" in ONLY:
         fixed()
