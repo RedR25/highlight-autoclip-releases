@@ -83,6 +83,11 @@ jobs:
           "INSTALL_DIR=$install" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "VIDEOS_DIR=$([Environment]::GetFolderPath('MyVideos'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
+      - name: Install VLC (a real player to hold an export open)
+        timeout-minutes: 6
+        shell: pwsh
+        run: choco install vlc -y --no-progress --limit-output
+
       - name: Drive the backend
         timeout-minutes: 30
         shell: pwsh

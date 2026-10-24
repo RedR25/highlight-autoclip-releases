@@ -163,6 +163,15 @@ def holders(b, person, source, tag):
             export(b, seg, f"{tag}: re-export while held open, share {label}")
         finally:
             k32.CloseHandle(h)
+    vlc = Path(r"C:\Program Files\VideoLAN\VLC\vlc.exe")
+    if vlc.exists():
+        seg = segment(person, source, "Giữ file VLC")
+        path = export(b, seg, "first", quiet=True)["path"]
+        player = subprocess.Popen([str(vlc), "-I", "dummy", "--dummy-quiet", "--vout=dummy", "--aout=dummy", "--loop", path])
+        time.sleep(5)
+        export(b, seg, f"{tag}: re-export while playing in VLC")
+        player.kill()
+        player.wait()
     # Electron itself: Node fs.openSync, exactly what media:// createReadStream does
     seg = segment(person, source, "Giữ file Node")
     path = export(b, seg, "first", quiet=True)["path"]
@@ -263,26 +272,35 @@ def shipped():
 
 PATCH = '''
 
-_replace_unpatched = replace
+import os as _os
+import sys as _sys
+
+_replace_unpatched = _os.replace
 
 
-def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+def _replace_fixed(src, dst):
     try:
-        return _replace_unpatched(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        return _replace_unpatched(src, dst)
     except PermissionError:
-        if not (fspath(src).endswith(".mp4.part") and fspath(dst).endswith(".mp4")):
+        if not (str(src).endswith(".mp4.part") and str(dst).endswith(".mp4")):
             raise
         # Windows can't replace a file another program has open. Deleting it first works when that program
         # shares delete (Electron's media://, Chromium): the name is free at once (POSIX delete, Windows 10 1809+).
         try:
-            unlink(dst)
+            _os.remove(dst)
         except PermissionError:
             raise ValueError("The clip's earlier file is open in another app. Close it, then try again.") from None
         return _replace_unpatched(src, dst)
+
+
+if _os.replace is _replace_unpatched:
+    _os.replace = _replace_fixed
+    _sys.stderr.write("debug: os.replace patched\\n")
 '''
 
 
 def patched_copy():
+    """os is frozen into python312.dll, so the patch rides in a stdlib module the app loads from base_library.zip."""
     dst = TEMP / "patched-app"
     if dst.exists():
         shutil.rmtree(dst)
@@ -290,15 +308,17 @@ def patched_copy():
     base = dst / "_internal" / "base_library.zip"
     with zipfile.ZipFile(base) as z:
         names = z.namelist()
-        log("base_library.zip has os.pyc:", "os.pyc" in names, "| entries:", len(names))
         blobs = {n: z.read(n) for n in names}
-    os_src = Path(sys.base_prefix) / "Lib" / "os.py"
-    work = TEMP / "os-patch"
+    log("base_library.zip:", len(names), "entries;", " ".join(sorted(n for n in names if "/" not in n))[:900])
+    target = next(n for n in ("linecache.pyc", "traceback.pyc", "functools.pyc", "enum.pyc") if n in names)
+    log("patching", target)
+    work = TEMP / "patch"
     work.mkdir(exist_ok=True)
-    (work / "os.py").write_text(os_src.read_text(encoding="utf-8") + PATCH, encoding="utf-8")
-    py_compile.compile(str(work / "os.py"), cfile=str(work / "os.pyc"), doraise=True,
+    src = Path(sys.base_prefix) / "Lib" / target.replace(".pyc", ".py")
+    (work / "m.py").write_text(src.read_text(encoding="utf-8") + PATCH, encoding="utf-8")
+    py_compile.compile(str(work / "m.py"), cfile=str(work / "m.pyc"), doraise=True,
                        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-    blobs["os.pyc"] = (work / "os.pyc").read_bytes()
+    blobs[target] = (work / "m.pyc").read_bytes()
     base.unlink()
     with zipfile.ZipFile(base, "w", zipfile.ZIP_DEFLATED) as z:
         for n in names:
