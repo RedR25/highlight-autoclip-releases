@@ -4,25 +4,30 @@ python debug/drive.py <install dir>
 Prints every render's state and error. Synthetic test media only; no personal data.
 """
 
+import ctypes
 import glob
 import json
 import os
+import py_compile
 import queue
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import zipfile
+from ctypes import wintypes
 from pathlib import Path
 
 INSTALL = Path(sys.argv[1])
-BACKEND = INSTALL / "resources" / "backend" / "backend.exe"
 APP = INSTALL / "highlight-autoclip-tool.exe"  # the Electron binary (AUTOCLIP_NODE)
 VIDEOS = Path(os.environ["VIDEOS_DIR"])
-DATA = Path(os.environ["RUNNER_TEMP"]) / "autoclip-data"
+TEMP = Path(os.environ["RUNNER_TEMP"])
 FFMPEG = glob.glob(str(INSTALL / "resources" / "backend" / "**" / "ffmpeg*.exe"), recursive=True)[0]
 ONLY = set(filter(None, os.environ.get("CASES", "").split(",")))
 RESULTS = []
+DATA = None
 
 
 def log(*a):
@@ -30,11 +35,13 @@ def log(*a):
 
 
 class Backend:
-    def __init__(self):
+    def __init__(self, exe, data):
+        global DATA
+        DATA = data
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
-        env.update(AUTOCLIP_DATA_DIR=str(DATA), AUTOCLIP_VIDEOS_DIR=str(VIDEOS), AUTOCLIP_NODE=str(APP),
+        env.update(AUTOCLIP_DATA_DIR=str(data), AUTOCLIP_VIDEOS_DIR=str(VIDEOS), AUTOCLIP_NODE=str(APP),
                    ELECTRON_RUN_AS_NODE="1")
-        self.p = subprocess.Popen([str(BACKEND)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.p = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
         self.pending, self.n, self.lock = {}, 0, threading.Lock()
         threading.Thread(target=self._out, daemon=True).start()
@@ -109,167 +116,213 @@ def segment(person, source, name, intervals=((2.0, 8.0), (10.0, 14.0))):
              json.dumps({"fade_in": 0.15, "fade_out": 0.3}))).lastrowid
 
 
-def export(b, seg, label):
+def export(b, seg, label, quiet=False):
     """render.segment as the Clip page calls it, then wait for the row to finish."""
     rid = b.call("render.segment", id=seg)["render_id"]
     r = wait(lambda: next((x for x in sql("select * from render where id = ?", rid)
-                           if x["state"] in ("done", "failed")), None), 300)
+                           if x["state"] in ("done", "failed")), None), 300, 0.5)
     if not r:
         r = (sql("select * from render where id = ?", rid) or [{}])[0]
     checks = json.loads(r.get("checks") or "null")
     path = r.get("path")
     res = {"case": label, "state": r.get("state"), "error": (checks or {}).get("error"),
-           "qc_ok": (checks or {}).get("ok"), "problems": (checks or {}).get("problems"),
-           "path_len": len(path) if path else None, "path": path,
-           "exists": bool(path) and os.path.exists(path)}
-    if path:
-        try:
-            res["media.allowed(render)"] = b.call("media.allowed", path=path)
-        except Exception as e:
-            res["media.allowed(render)"] = f"ERROR {e}"
-    RESULTS.append(res)
-    log("RESULT", json.dumps(res, ensure_ascii=False))
+           "path_len": len(path) if path else None, "path": path}
+    if not quiet:
+        RESULTS.append(res)
+        log("RESULT", json.dumps(res, ensure_ascii=False))
     return res
+
+
+# --- holders: another program with the earlier export open, by Windows share mode --------------------
+
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateFileW.restype = wintypes.HANDLE
+k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                            wintypes.DWORD, wintypes.HANDLE]
+READ, WRITE, DELETE = 1, 2, 4
+
+
+def hold(path, share):
+    h = k32.CreateFileW(path, 0x80000000, share, None, 3, 0x80, None)  # GENERIC_READ, OPEN_EXISTING
+    if h in (None, wintypes.HANDLE(-1).value):
+        raise OSError(ctypes.get_last_error(), "CreateFileW")
+    return h
+
+
+def holders(b, person, source, tag):
+    """Re-export a clip while its earlier export is held open with each share mode."""
+    for label, share in (("read", READ), ("read|write", READ | WRITE), ("read|write|delete (libuv = media://)",
+                         READ | WRITE | DELETE), ("read|delete", READ | DELETE)):
+        seg = segment(person, source, f"Giữ file {share}")
+        first = export(b, seg, "first", quiet=True)
+        if first["state"] != "done":
+            log("first export failed", first)
+            continue
+        h = hold(first["path"], share)
+        try:
+            export(b, seg, f"{tag}: re-export while held open, share {label}")
+        finally:
+            k32.CloseHandle(h)
+    # Electron itself: Node fs.openSync, exactly what media:// createReadStream does
+    seg = segment(person, source, "Giữ file Node")
+    path = export(b, seg, "first", quiet=True)["path"]
+    holder = subprocess.Popen([str(APP), "-e", "const fs=require('fs');const fd=fs.openSync(process.argv[1],'r');"
+                               "console.log('node holds',fd);setTimeout(()=>{},90000)", path],
+                              env={**os.environ, "ELECTRON_RUN_AS_NODE": "1"}, stdout=subprocess.PIPE, text=True)
+    log(holder.stdout.readline().strip())
+    export(b, seg, f"{tag}: re-export while open by Electron-as-Node fs (media:// stream)")
+    holder.kill()
+    holder.wait()
 
 
 def make_sources(folder):
     folder.mkdir(parents=True, exist_ok=True)
-    enc = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
-    dec = subprocess.run([FFMPEG, "-hide_banner", "-decoders"], capture_output=True, text=True).stdout
-    log("ffmpeg:", subprocess.run([FFMPEG, "-version"], capture_output=True, text=True).stdout.splitlines()[0])
-    log("av1 decoders:", [l.split()[1] for l in dec.splitlines() if "av1" in l.lower() and len(l.split()) > 1])
-    av1 = next((e for e in ("libsvtav1", "libaom-av1", "librav1e") if f" {e} " in enc), None)
-    log("av1 encoder:", av1, "| libvpx-vp9:", " libvpx-vp9 " in enc, "| libopus:", " libopus " in enc)
     v = ["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-f", "lavfi", "-i",
-         "sine=frequency=330:sample_rate=48000,volume=0.3", "-t", "20", "-ac", "2"]
-    small = ["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-f", "lavfi", "-i",
-             "sine=frequency=330:sample_rate=48000,volume=0.3", "-t", "20", "-ac", "2"]
-    vp9 = ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "800k", "-c:a", "libopus", "-b:a", "96k"]
-    av1a = {"libsvtav1": ["-c:v", "libsvtav1", "-preset", "12"],
-            "libaom-av1": ["-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1", "-b:v", "500k"],
-            "librav1e": ["-c:v", "librav1e", "-speed", "10"]}.get(av1)
+         "anoisesrc=color=pink:sample_rate=48000:amplitude=0.2", "-t", "20", "-ac", "2"]
     made = {
-        # yt-dlp windowsfilenames turns | " : ? into full-width look-alikes
         "Trấn Thành – Hài độc thoại ＂Bố già＂ ｜ Đặc biệt (Full Show) [Youtube-a1B2c3D4e5F].mp4":
             [*v, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
              "-ar", "44100", "-movflags", "+faststart"],
-        "Cem Yılmaz – İstanbul Şov ÇĞİÖŞÜ çğıöşü [Youtube-x9Y8w7V6u5T].webm": [*small, *vp9],
-        "Hài độc thoại VP9 Opus trong mp4 [Youtube-vp9mp4AAAAA].mp4": [*small, *vp9],
     }
-    if av1a:
-        made["Độc thoại AV1 Opus webm [Youtube-av1webmAAAA].webm"] = [*small, *av1a, "-c:a", "libopus", "-b:a", "96k"]
-        made["Độc thoại AV1 Opus mp4 [Youtube-av1mp4AAAAA].mp4"] = [*small, *av1a, "-c:a", "libopus", "-b:a", "96k"]
     for name, args in made.items():
         out = folder / name
         if not out.exists():
             log("making", name, ff(*args, str(out)))
+    return len(made)
 
 
-def cases(b, person, slug):
-    lib = Path(b.call("settings.get")["library_root"])
-    log("library_root:", lib)
-
-    # --- 1. a real download through the app's own downloader -----------------------------------
-    if not ONLY or "download" in ONLY:
-        for url in ("ytsearch1:hài độc thoại Việt Nam", "https://www.youtube.com/watch?v=jNQXAC9IVRw"):
-            try:
-                r = b.call("links.resolve", person_id=person, url=url, timeout=120)
-            except Exception as e:
-                log("links.resolve error", e)
-                continue
-            item = r if r["kind"] == "video" else (r.get("entries") or [None])[0] if r["kind"] == "playlist" else None
-            log("links.resolve", url, "->", r["kind"], r.get("reason") or (item or {}).get("title"))
-            if not item:
-                continue
-            b.call("downloads.add", person_id=person, items=[item])
-            d = wait(lambda: next((x for x in sql("select * from download where site_key = ?", item["site_key"])
-                                   if x["state"] in ("done", "failed")), None), 420, 3)
-            log("download:", d and d["state"], d and d["error"])
-            if d and d["state"] == "done":
-                break
-
-    # --- 2. sources in an attached folder, codecs YouTube serves, non-ASCII names ---------------
+def setup(b):
+    p = b.call("person.create", name="Trấn Thành")
+    log("person", p["id"], p["slug"], p["storage"])
     folder = VIDEOS / "Nguồn video ğİş"
-    make_sources(folder)
-    log("folders.attach", b.call("folders.attach", person_id=person, paths=[str(folder)]))
-    n = len([p for p in folder.iterdir() if p.is_file()])
-    wait(lambda: len(sql("select 1 from source where folder_id is not null and status != 'scanning'")) >= n, 300, 2)
-    time.sleep(3)
-    sources = sql("select s.*, d.title as dtitle from source s left join download d on d.id = s.download_id")
-    for s in sources:
-        log("source", s["id"], s["status"], s["error"], s["vcodec"], s["acodec"], s["duration"], s["path"])
+    n = make_sources(folder)
+    log("folders.attach", b.call("folders.attach", person_id=p["id"], paths=[str(folder)]))
+    wait(lambda: len(sql("select 1 from source where folder_id is not null and status != 'scanning'")) >= n, 300, 1)
+    time.sleep(2)
+    s = sql("select * from source where status = 'ready' and folder_id is not null")[0]
+    log("source", s["id"], s["vcodec"], s["acodec"], s["duration"])
+    return p, s
+
+
+def download(b, person):
+    """The app's own downloader on a real, publicly hosted file (YouTube bot-checks this runner)."""
+    url = "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
+    r = b.call("links.resolve", person_id=person, url=url, timeout=120)
+    log("links.resolve ->", r.get("kind"), r.get("reason") or r.get("title"))
+    if r.get("kind") != "video":
+        return None
+    b.call("downloads.add", person_id=person, items=[r])
+    d = wait(lambda: next((x for x in sql("select * from download where site_key = ?", r["site_key"])
+                           if x["state"] in ("done", "failed")), None), 300, 2)
+    log("download:", d and d["state"], d and d["error"])
+    s = wait(lambda: next((x for x in sql("select * from source where download_id is not null")
+                           if x["status"] != "scanning"), None), 120, 1)
+    log("downloaded source:", s and (s["status"], s["vcodec"], s["acodec"], s["path"]))
+    return s if s and s["status"] == "ready" else None
+
+
+def shipped():
+    b = Backend(INSTALL / "resources" / "backend" / "backend.exe", TEMP / "data-shipped")
+    try:
+        log("ping", b.call("ping", timeout=120))
+        p, s = setup(b)
+        if not ONLY or "download" in ONLY:
+            d = download(b, p["id"])
+            if d:
+                export(b, segment(p["id"], d["id"], "Thỏ khổng lồ: “cảnh mở đầu”", ((30.0, 40.0), (45.0, 52.0))),
+                       "real file through the app's downloader")
+        if not ONLY or "fresh" in ONLY:
+            # first exports and immediate re-exports with nothing holding them (Defender scans on close)
+            fails = []
+            for i in range(10):
+                seg = segment(p["id"], s["id"], f"Lần xuất mới số {i}: “đi chợ Tết”?")
+                for j in range(3):
+                    r = export(b, seg, f"fresh {i}.{j}", quiet=True)
+                    if r["state"] != "done":
+                        fails.append(r)
+            res = {"case": "30 exports (10 new files, each re-exported twice), no holder", "failed": len(fails),
+                   "errors": sorted({f["error"] for f in fails})}
+            RESULTS.append(res)
+            log("RESULT", json.dumps(res, ensure_ascii=False))
+        if not ONLY or "long" in ONLY:
+            root = VIDEOS / ("Highlight Autoclip library for stand-up comedy clips and compilations " * 2).strip()
+            lib = b.call("settings.get")["library_root"]
+            b.call("settings.set", key="library_root", value=str(root))
+            export(b, segment(p["id"], s["id"], "Long name ASCII " + "x" * 130), "path > 260 chars")
+            b.call("settings.set", key="library_root", value=lib)
+        if not ONLY or "holders" in ONLY:
+            holders(b, p["id"], s["id"], "1.0.4")
+    finally:
+        b.stop()
+
+
+# --- the proposed fix, applied to a copy of the installed app ------------------------------------------
+# render.py's os.replace(tmp, out_path) is the only replace on a clip export's path. Its fix, a fallback that
+# deletes the earlier file first, is patched into the frozen app's own os module (base_library.zip): the same
+# CPython (3.12.10) compiles it, and only an "<x>.mp4.part" -> "<x>.mp4" replace takes the new branch.
+
+PATCH = '''
+
+_replace_unpatched = replace
+
+
+def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    try:
+        return _replace_unpatched(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    except PermissionError:
+        if not (fspath(src).endswith(".mp4.part") and fspath(dst).endswith(".mp4")):
+            raise
+        # Windows can't replace a file another program has open. Deleting it first works when that program
+        # shares delete (Electron's media://, Chromium): the name is free at once (POSIX delete, Windows 10 1809+).
         try:
-            log("  media.allowed(source):", b.call("media.allowed", path=s["path"]))
-        except Exception as e:
-            log("  media.allowed(source) ERROR", e)
-    ready = [s for s in sources if s["status"] == "ready"]
+            unlink(dst)
+        except PermissionError:
+            raise ValueError("The clip's earlier file is open in another app. Close it, then try again.") from None
+        return _replace_unpatched(src, dst)
+'''
 
-    first = None
-    if not ONLY or "codecs" in ONLY:
-        for s in ready:
-            dur = s["duration"] or 20
-            iv = ((1.0, min(6.0, dur - 1)), (min(8.0, dur - 0.5) - 1.5, min(8.0, dur - 0.5)))
-            seg = segment(person, s["id"], "Chuyện ông bố đi chợ Tết: “mua gì cũng được”?", iv)
-            r = export(b, seg, f"codec {s['vcodec']}/{s['acodec']} {Path(s['path']).suffix}")
-            if r["state"] == "done" and first is None:
-                first = (seg, r["path"])
 
-    base = next((s for s in ready if s["vcodec"] == "h264"), ready[0] if ready else None)
-    if base is None:
-        log("no ready source; stopping")
-        return
+def patched_copy():
+    dst = TEMP / "patched-app"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(INSTALL / "resources" / "backend", dst)
+    base = dst / "_internal" / "base_library.zip"
+    with zipfile.ZipFile(base) as z:
+        names = z.namelist()
+        log("base_library.zip has os.pyc:", "os.pyc" in names, "| entries:", len(names))
+        blobs = {n: z.read(n) for n in names}
+    os_src = Path(sys.base_prefix) / "Lib" / "os.py"
+    work = TEMP / "os-patch"
+    work.mkdir(exist_ok=True)
+    (work / "os.py").write_text(os_src.read_text(encoding="utf-8") + PATCH, encoding="utf-8")
+    py_compile.compile(str(work / "os.py"), cfile=str(work / "os.pyc"), doraise=True,
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    blobs["os.pyc"] = (work / "os.pyc").read_bytes()
+    base.unlink()
+    with zipfile.ZipFile(base, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in names:
+            z.writestr(n, blobs[n])
+    return dst / "backend.exe"
 
-    # --- 3. re-export while the previous export is open ---------------------------------------
-    if (not ONLY or "reopen" in ONLY) and first:
-        seg, path = first
-        # (a) like Electron's media:// stream: Node fs (libuv opens with read|write|delete sharing)
-        holder = subprocess.Popen([str(APP), "-e", "const fs=require('fs');const fd=fs.openSync(process.argv[1],'r');"
-                                   "console.log('node holds',fd);setTimeout(()=>{},90000)", path],
-                                  env={**os.environ, "ELECTRON_RUN_AS_NODE": "1"}, stdout=subprocess.PIPE, text=True)
-        log(holder.stdout.readline().strip())
-        export(b, seg, "re-export while open by Node fs (media:// stream)")
-        holder.kill()
-        holder.wait()
-        # (b) a reader without delete sharing (Python open(); a player or Explorer preview)
-        path = sql("select path from render where kind='segment' and ref_id=? and state='done' order by id desc", seg)
-        if path:
-            with open(path[0]["path"], "rb"):
-                export(b, seg, "re-export while open without FILE_SHARE_DELETE")
 
-    # --- 4. library on a path with spaces and non-ASCII characters ----------------------------
-    if not ONLY or "unicode-root" in ONLY:
-        root = VIDEOS / "Thư viện Highlight Autoclip ğİş"
-        b.call("settings.set", key="library_root", value=str(root))
-        seg = segment(person, base["id"], "İstanbul trafiğinde şoförle kavga")
-        export(b, seg, "library root with spaces/unicode")
-        b.call("settings.set", key="library_root", value=str(lib))
-
-    # --- 5. very long resulting path ------------------------------------------------------------
-    if not ONLY or "long" in ONLY:
-        long_name = ("Khi tôi kể chuyện bố mẹ tôi đi du lịch nước ngoài lần đầu tiên và lạc mất hộ chiếu ở sân bay "
-                     "rồi phải gọi cho đại sứ quán lúc nửa đêm")
-        seg = segment(person, base["id"], long_name)
-        export(b, seg, f"long clip name ({len(long_name)} chars)")
-        root = VIDEOS / ("Highlight Autoclip library for stand-up comedy clips and compilations " * 2).strip()
-        b.call("settings.set", key="library_root", value=str(root))
-        seg = segment(person, base["id"], "Long name ASCII " + "x" * 130)
-        export(b, seg, "path > 260 chars (deep library root, long clip name)")
-        b.call("settings.set", key="library_root", value=str(lib))
+def fixed():
+    exe = patched_copy()
+    b = Backend(exe, TEMP / "data-fixed")
+    try:
+        log("ping (patched)", b.call("ping", timeout=120))
+        p, s = setup(b)
+        holders(b, p["id"], s["id"], "with fix")
+    finally:
+        b.stop()
 
 
 def main():
     log("python", sys.version)
-    log("backend:", BACKEND, BACKEND.exists())
     log("videos:", VIDEOS)
-    b = Backend()
-    try:
-        log("ping", b.call("ping", timeout=120))
-        p = b.call("person.create", name="Trấn Thành")
-        log("person", p["id"], p["slug"], p["storage"])
-        cases(b, p["id"], p["slug"])
-    finally:
-        time.sleep(1)
-        b.stop()
+    shipped()
+    if not ONLY or "fix" in ONLY:
+        fixed()
     log("\n===== SUMMARY =====")
     for r in RESULTS:
         log(json.dumps(r, ensure_ascii=False))

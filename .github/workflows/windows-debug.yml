@@ -6,11 +6,15 @@ on:
   workflow_dispatch:
     inputs:
       cases:
-        description: "Comma-separated cases (download,codecs,reopen,unicode-root,long); empty = all"
+        description: "Comma-separated cases (download,fresh,long,holders,fix); empty = all"
         required: false
         default: ""
       longpaths:
         description: "LongPathsEnabled to set before the run (keep, 0 or 1)"
+        required: false
+        default: "keep"
+      defender:
+        description: "Turn on Defender real-time protection first (on or keep)"
         required: false
         default: "keep"
 
@@ -47,6 +51,21 @@ jobs:
         run: |
           Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -Value ${{ inputs.longpaths }}
           Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled | Select-Object LongPathsEnabled
+
+      - name: Turn on Defender real-time protection
+        if: inputs.defender == 'on'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          Remove-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Recurse -ErrorAction SilentlyContinue
+          $p = Get-MpPreference
+          if ($p.ExclusionPath) { Remove-MpPreference -ExclusionPath $p.ExclusionPath -ErrorAction Continue }
+          if ($p.ExclusionProcess) { Remove-MpPreference -ExclusionProcess $p.ExclusionProcess -ErrorAction Continue }
+          if ($p.ExclusionExtension) { Remove-MpPreference -ExclusionExtension $p.ExclusionExtension -ErrorAction Continue }
+          Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableIOAVProtection $false -ErrorAction Continue
+          Start-Sleep -Seconds 10
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, OnAccessProtectionEnabled, IoavProtectionEnabled, BehaviorMonitorEnabled | Format-List
+          Get-MpPreference | Select-Object DisableRealtimeMonitoring, ExclusionPath, ExclusionProcess | Format-List
 
       - name: Install Highlight Autoclip 1.0.4
         timeout-minutes: 10
