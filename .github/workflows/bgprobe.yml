@@ -1,0 +1,15 @@
+name: bg probe (temporary)
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install imageio-ffmpeg==0.6.0 av==19.0.2 numpy==2.5.4
+      - run: python debug/bgprobe.py
