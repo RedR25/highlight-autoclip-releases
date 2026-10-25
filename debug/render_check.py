@@ -25,7 +25,7 @@ FFMPEG = glob.glob(str(INSTALL / "resources" / "backend" / "**" / "ffmpeg*.exe")
 TEMP = Path(os.environ["RUNNER_TEMP"])
 VIDEOS = Path(os.environ["VIDEOS_DIR"])
 WRAP = os.environ.get("FFWRAP")
-CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["en-raw", "en", "vi", "profile"]
+CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["bigimg", "en-raw", "en", "vi", "profile"]
 PD = "https://upload.wikimedia.org/wikipedia/commons/f/f4/20161008_Weekly_Address_HD.webm"  # public domain
 RESULTS = []
 
@@ -143,7 +143,7 @@ def source_file():
 
 SRCS = ["testsrc2=s=6000x4000", "smptehdbars=s=5472x3648", "rgbtestsrc=s=4000x6000", "testsrc=s=4608x3072",
         "gradients=s=6000x4000:seed=1", "gradients=s=5184x3456:seed=2", "cellauto=s=3000x2000:rule=110",
-        "colorspectrum=s=6000x4000", "testsrc2=s=1920x1280", "smptebars=s=7952x5304"]
+        "colorspectrum=s=6000x4000", "testsrc2=s=1920x1280", "smptebars=s=6000x4000"]
 
 
 def backgrounds(folder):
@@ -258,6 +258,24 @@ def case(name):
                 log("  stderr:", c["stderr"][-3000:] or "(empty)")
 
 
+BG = "scale=1920:1080:force_original_aspect_ratio=increase:out_color_matrix=bt709:out_range=tv,crop=1920:1080,format=yuv420p"
+
+
+def bigimg():
+    """stitch._bg's command, by hand, on large synthetic JPEGs (Pexels originals are often 6000-8000 px wide)."""
+    log("\n===== case bigimg =====")
+    d = TEMP / "bigimg"
+    d.mkdir(exist_ok=True)
+    for size in ("6000x4000", "6720x4480", "7008x4672", "7360x4912", "7680x4320", "7952x5304", "8192x5464", "5304x7952"):
+        img = d / f"{size}.jpeg"
+        ff("-f", "lavfi", "-i", f"smptebars=s={size}", "-frames:v", "1", "-q:v", "3", str(img))
+        for label, vf in (("app", BG), ("no matrix", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p"),
+                          ("decode only", "null")):
+            r = subprocess.run([FFMPEG, "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", str(img), "-vf", vf, "-frames:v", "1",
+                                "-f", "rawvideo", str(d / "out.yuv")], capture_output=True)
+            log(f"{size} {label}: exit {hex(r.returncode & 0xFFFFFFFF)} stderr={r.stderr.decode('utf-8', 'replace')[-300:]!r}")
+
+
 def facts():
     log("python", sys.version)
     log("ffmpeg", FFMPEG)
@@ -270,7 +288,7 @@ def facts():
 def main():
     facts()
     for c in CASES:
-        case(c)
+        bigimg() if c == "bigimg" else case(c)
     log("\n===== SUMMARY =====")
     for r in RESULTS:
         log(json.dumps(r, ensure_ascii=False))
