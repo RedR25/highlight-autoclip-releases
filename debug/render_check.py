@@ -25,13 +25,14 @@ FFMPEG = glob.glob(str(INSTALL / "resources" / "backend" / "**" / "ffmpeg*.exe")
 TEMP = Path(os.environ["RUNNER_TEMP"])
 VIDEOS = Path(os.environ["VIDEOS_DIR"])
 WRAP = os.environ.get("FFWRAP")
-CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["bigimg", "en-raw", "en", "vi", "profile"]
+CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["glyphs", "fake-nvenc", "en"]
 PD = "https://upload.wikimedia.org/wikipedia/commons/f/f4/20161008_Weekly_Address_HD.webm"  # public domain
 RESULTS = []
 
 WORDS = {
     "en": "so my mother calls me last night and she says honey I joined the internet and I said mom you can't join "
           "the internet it isn't a club and she said well they gave me a password so it's a club".split(),
+    "glyphs": "♪ привет мир ♪ 你好世界 😂 so … — “quoted” №1 ½ café straße ﬁne".split(),
     "vi": "xin chào các bạn hôm nay tôi sẽ kể một câu chuyện rất buồn cười về gia đình của tôi mẹ tôi gọi điện "
           "bảo con ơi mẹ vừa vào mạng rồi đấy mẹ còn có cả mật khẩu nữa".split(),
 }
@@ -175,7 +176,7 @@ def sentences(lang, end):
 
 def case(name):
     log(f"\n===== case {name} =====")
-    raw, lang = name.endswith("-raw"), "vi" if name.startswith("vi") else "en"
+    raw, lang = name.endswith("-raw"), "vi" if name.startswith("vi") else "glyphs" if name == "glyphs" else "en"
     extra = {}
     if name == "profile":  # a Windows user whose name isn't ASCII: AppData, Videos and TEMP under it
         home = TEMP / "Users" / "Trần Văn Đức"
@@ -190,6 +191,8 @@ def case(name):
     if WRAP and not raw:
         fflog.mkdir(exist_ok=True)
         extra.update(IMAGEIO_FFMPEG_EXE=WRAP, REAL_FFMPEG=FFMPEG, FFLOG=str(fflog))
+        if name == "fake-nvenc":  # a simulation: NVENC passes the probe, then fails at encoder start on every piece
+            extra.update(FAKE_NVENC="early")
     b = Backend(data, videos, extra)
     res = {"case": name}
     try:
@@ -252,6 +255,9 @@ def case(name):
         log(f"{len(calls)} ffmpeg calls logged")
         for f in calls:
             c = json.loads(f.read_text(encoding="utf-8"))
+            if c["code"] == 0 and c["stderr"].strip():
+                log("ffmpeg ok, with stderr:", json.dumps(c["args"][-12:], ensure_ascii=False))
+                log("  stderr:", c["stderr"][-1500:])
             if c["code"] != 0:
                 log("FFMPEG FAILED", c["hex"], f"{c['secs']:.1f}s", "err:", c["err"])
                 log("  args:", json.dumps(c["args"], ensure_ascii=False))
