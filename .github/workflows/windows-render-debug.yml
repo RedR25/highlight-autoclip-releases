@@ -1,0 +1,76 @@
+name: Windows render debug (temporary)
+
+# Temporary: renders a highlight video with the released Windows build to reproduce a failure. Removed when done.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "Comma-separated cases (en-raw,en,vi,profile); empty = all"
+        required: false
+        default: ""
+      version:
+        description: "Release tag to install"
+        required: false
+        default: "v1.0.8"
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        timeout-minutes: 5
+
+      - uses: actions/setup-python@v6
+        timeout-minutes: 5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v6
+        timeout-minutes: 5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Machine facts
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion | Format-List
+          "Videos: " + [Environment]::GetFolderPath('MyVideos')
+          "ACP: " + (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage).ACP
+
+      - name: Install Highlight Autoclip
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ inputs.version }} -R $env:GITHUB_REPOSITORY -p '*windows-x64-setup.exe' -D "$env:RUNNER_TEMP\setup"
+          $setup = Get-ChildItem "$env:RUNNER_TEMP\setup\*.exe" | Select-Object -First 1
+          Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
+          $backend = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles" -Recurse -Filter backend.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $install = $backend.Directory.Parent.Parent.FullName
+          "Installed at $install"
+          "INSTALL_DIR=$install" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "VIDEOS_DIR=$([Environment]::GetFolderPath('MyVideos'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build the ffmpeg logging wrapper
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          go build -o "$env:RUNNER_TEMP\ffwrap\ffmpeg.exe" debug/ffwrap.go
+          "FFWRAP=$env:RUNNER_TEMP\ffwrap\ffmpeg.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Render
+        timeout-minutes: 70
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          CASES: ${{ inputs.cases }}
+        run: python -X utf8 debug/render_check.py "$env:INSTALL_DIR"
