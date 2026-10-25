@@ -25,7 +25,7 @@ FFMPEG = glob.glob(str(INSTALL / "resources" / "backend" / "**" / "ffmpeg*.exe")
 TEMP = Path(os.environ["RUNNER_TEMP"])
 VIDEOS = Path(os.environ["VIDEOS_DIR"])
 WRAP = os.environ.get("FFWRAP")
-CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["glyphs", "fake-nvenc", "en"]
+CASES = [c for c in os.environ.get("CASES", "").split(",") if c] or ["fake-bframes", "fake-late", "webm"]
 PD = "https://upload.wikimedia.org/wikipedia/commons/f/f4/20161008_Weekly_Address_HD.webm"  # public domain
 RESULTS = []
 
@@ -193,6 +193,8 @@ def case(name):
         extra.update(IMAGEIO_FFMPEG_EXE=WRAP, REAL_FFMPEG=FFMPEG, FFLOG=str(fflog))
         if name == "fake-nvenc":  # a simulation: NVENC passes the probe, then fails at encoder start on every piece
             extra.update(FAKE_NVENC="early")
+        if name in ("fake-bframes", "fake-late"):  # simulations of a hardware encoder's output (see ffwrap.go)
+            extra.update(FAKE_NVENC=name[5:])
     b = Backend(data, videos, extra)
     res = {"case": name}
     try:
@@ -200,7 +202,11 @@ def case(name):
         p = b.call("person.create", name="Trấn Thành" if lang == "vi" else "Test Comedian")
         folder = videos / ("Nguồn video" if lang == "vi" else "Sources")
         folder.mkdir(parents=True, exist_ok=True)
-        shutil.copy(source_file(), folder / "set.mp4")
+        if name == "webm":  # the public-domain file as it is: VP9 + Vorbis/Opus WebM
+            source_file()
+            shutil.copy(TEMP / "pd.webm", folder / "set.webm")
+        else:
+            shutil.copy(source_file(), folder / "set.mp4")
         b.call("folders.attach", person_id=p["id"], paths=[str(folder)])
         s = wait(lambda: next(iter(b.sql("select * from source where status != 'scanning'")), None), 300)
         log("source", {k: s[k] for k in ("id", "status", "width", "height", "fps", "duration", "vcodec", "acodec", "path")})

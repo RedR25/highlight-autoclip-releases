@@ -1,7 +1,9 @@
 // Temporary: stands in for ffmpeg.exe (IMAGEIO_FFMPEG_EXE) and logs each call's arguments, exit code and stderr
 // to FFLOG, then exits with ffmpeg's own code. stdin and stdout are ffmpeg's own handles.
 // FAKE_NVENC=early (a simulation, for the app's fallback): the h264_nvenc probe "passes", and every h264_nvenc piece reads
-// one frame and fails at encoder start, as an NVENC session error would.
+// one frame and fails at encoder start, as an NVENC session error would. FAKE_NVENC=bframes: the probe "passes" and every
+// h264_nvenc piece is made by libx264 with B-frames (a stand-in for a hardware encoder's output). FAKE_NVENC=late: as
+// bframes, but the piece v00001 reads all its frames and then fails, as a hardware encoder failing at flush would.
 package main
 
 import (
@@ -26,7 +28,28 @@ func record(start time.Time, args []string, code int, stderr, msg string) {
 func main() {
 	args, start := os.Args[1:], time.Now()
 	joined := strings.Join(args, " ")
-	if os.Getenv("FAKE_NVENC") == "early" && strings.Contains(joined, "h264_nvenc") {
+	fake := os.Getenv("FAKE_NVENC")
+	if (fake == "bframes" || fake == "late") && strings.Contains(joined, "h264_nvenc") {
+		if strings.Contains(joined, "testsrc2=s=1280x720:r=30:d=0.3") {
+			record(start, args, 0, "", "fake probe pass")
+			os.Exit(0)
+		}
+		if fake == "late" && strings.Contains(args[len(args)-1], "v00001") {
+			io.Copy(io.Discard, os.Stdin)
+			e := "[h264_nvenc @ 0000000000000000] EncodePicture failed!: out of memory (10): (no details)\n"
+			os.Stderr.WriteString(e)
+			record(start, args, -1, e, "fake nvenc late failure")
+			os.Exit(-1)
+		}
+		for i := 0; i+11 < len(args); i++ { // -c:v h264_nvenc and its 10 quality arguments
+			if args[i] == "-c:v" && args[i+1] == "h264_nvenc" {
+				x := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-bf", "3", "-profile:v", "high"}
+				args = append(append(append([]string{}, args[:i]...), x...), args[i+12:]...)
+				break
+			}
+		}
+	}
+	if fake == "early" && strings.Contains(joined, "h264_nvenc") {
 		if strings.Contains(joined, "testsrc2=s=1280x720:r=30:d=0.3") {
 			record(start, args, 0, "", "fake probe pass")
 			os.Exit(0)
