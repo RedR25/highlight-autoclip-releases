@@ -20,9 +20,9 @@ permissions:
 
 jobs:
   build:
-    # macOS 14 on Apple Silicon: the oldest macOS the app runs on (PyAV's wheels), so what's built
-    # here loads there.
-    runs-on: macos-14
+    # macOS 15 on Apple Silicon: GitHub retired the macOS 14 runner. The app still runs on 14 (PyAV's
+    # wheels): "Check the backend loads on macOS 14" below fails a build that wouldn't.
+    runs-on: macos-15
     timeout-minutes: 75
     defaults:
       run:
